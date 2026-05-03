@@ -1,13 +1,12 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
+import html2pdf from 'html2pdf.js'
 import logoImg from '../lastloggoooo.jpg'
 import {
   AlertTriangle,
   ClipboardCheck,
   Cpu,
   Download,
-  Eye,
-  EyeOff,
   FileDigit,
   FileSearch,
   FileText,
@@ -26,8 +25,12 @@ import {
   Copy,
   Check,
   UserRound,
+  LogOut,
 } from 'lucide-react'
 import './App.css'
+import { getApiBaseUrl } from './apiBase.js'
+import { AuthProvider, useAuth } from './auth/AuthContext'
+import { LoginPage } from './pages/LoginPage'
 import { MarkdownBlock } from './components/MarkdownBlock'
 import { MitreAttackMap } from './components/MitreAttackMap'
 
@@ -83,11 +86,293 @@ function stripIdsFromForensicReportTitle(text) {
   return text.replace(/التقرير الجنائي الرقمي\s*\(\s*IDS\s*\)/g, 'التقرير الجنائي الرقمي')
 }
 
+/** Safe segment for download filenames (allows Arabic; strips path/reserved chars). */
+function sanitizeFileNameSegment(name) {
+  const forbidden = new Set([...'<>:"/\\|?*'])
+  const cleaned = [...String(name || '')]
+    .filter((ch) => {
+      const code = ch.codePointAt(0)
+      if (code <= 31) return false
+      if (forbidden.has(ch)) return false
+      return true
+    })
+    .join('')
+    .trim()
+    .slice(0, 64)
+  return cleaned || 'investigator'
+}
+
+/** Injected into the html2canvas clone — formal letterhead + body card (RTL, print-safe colors). */
+const REPORT_PDF_EXPORT_CSS = `
+  .report-preview--pdf-export,
+  .report-preview--pdf-export * {
+    box-sizing: border-box !important;
+  }
+  .report-preview--pdf-export {
+    direction: rtl !important;
+    background: #eceff1 !important;
+    color: #1a1a1a !important;
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    padding: 14px 12px 18px !important;
+    font-family: "Segoe UI", Tahoma, "Arial Unicode MS", "Noto Naskh Arabic", sans-serif !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+  .report-pdf-letterhead {
+    margin: 0 0 16px 0 !important;
+    padding: 0 !important;
+    border-radius: 10px !important;
+    overflow: hidden !important;
+    border: 1px solid #b0bec5 !important;
+    background: linear-gradient(180deg, #ffffff 0%, #f5faf7 100%) !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06) !important;
+  }
+  .report-pdf-letterhead__accent {
+    height: 6px !important;
+    background: linear-gradient(90deg, #03512c 0%, #1b5e20 38%, #2e7d32 70%, #6eb870 100%) !important;
+  }
+  .report-pdf-letterhead__inner {
+    padding: 18px 20px 16px !important;
+    text-align: center !important;
+  }
+  .report-pdf-letterhead__brand {
+    font-size: 23pt !important;
+    font-weight: 800 !important;
+    color: #0d3d28 !important;
+    letter-spacing: 0.03em !important;
+    line-height: 1.2 !important;
+  }
+  .report-pdf-letterhead__title {
+    font-size: 13pt !important;
+    font-weight: 700 !important;
+    color: #1b5e20 !important;
+    margin-top: 8px !important;
+  }
+  .report-pdf-letterhead__subtitle {
+    font-size: 10pt !important;
+    color: #455a64 !important;
+    margin-top: 5px !important;
+    line-height: 1.55 !important;
+    max-width: 36em !important;
+    margin-inline: auto !important;
+  }
+  .report-pdf-letterhead__meta {
+    font-size: 9pt !important;
+    color: #607d8b !important;
+    margin-top: 12px !important;
+    padding-top: 12px !important;
+    border-top: 1px solid #cfd8dc !important;
+  }
+  .report-preview--pdf-export .report-markdown {
+    background: #ffffff !important;
+    border: 1px solid #cfd8dc !important;
+    border-radius: 10px !important;
+    padding: 22px 26px 26px !important;
+    margin: 0 !important;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.07) !important;
+  }
+  .report-preview--pdf-export .markdown-body {
+    font-size: 11pt !important;
+    line-height: 1.72 !important;
+    color: #263238 !important;
+  }
+  .report-preview--pdf-export .markdown-body h1 {
+    font-size: 17pt !important;
+    color: #0d3d28 !important;
+    border-bottom: 2px solid #2e7d32 !important;
+    padding-bottom: 10px !important;
+    margin: 0 0 0.75em 0 !important;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+    letter-spacing: 0.02em !important;
+  }
+  .report-preview--pdf-export .markdown-body h2 {
+    font-size: 13.5pt !important;
+    color: #1b5e20 !important;
+    margin: 1.35em 0 0.5em 0 !important;
+    padding: 0 0 0 0 !important;
+    padding-inline-start: 12px !important;
+    border-inline-start: 4px solid #2e7d32 !important;
+    page-break-after: avoid !important;
+    break-after: avoid !important;
+  }
+  .report-preview--pdf-export .markdown-body h3,
+  .report-preview--pdf-export .markdown-body h4 {
+    font-size: 11.5pt !important;
+    color: #2e7d32 !important;
+    margin-top: 1.1em !important;
+    page-break-after: avoid !important;
+  }
+  .report-preview--pdf-export .markdown-body p {
+    margin: 0.55em 0 !important;
+    text-align: justify !important;
+    text-justify: inter-word !important;
+  }
+  .report-preview--pdf-export .markdown-body li {
+    color: #263238 !important;
+    margin: 0.35em 0 !important;
+    text-align: start !important;
+  }
+  .report-preview--pdf-export .markdown-body ul,
+  .report-preview--pdf-export .markdown-body ol {
+    padding-inline-start: 1.5rem !important;
+    margin: 0.65em 0 !important;
+  }
+  .report-preview--pdf-export .markdown-body hr {
+    border: none !important;
+    border-top: 1px solid #b0bec5 !important;
+    margin: 1.25em 0 !important;
+  }
+  .report-preview--pdf-export .markdown-body strong {
+    color: #1b4332 !important;
+    font-weight: 700 !important;
+  }
+  .report-preview--pdf-export .markdown-body code {
+    direction: ltr !important;
+    unicode-bidi: isolate !important;
+    background: #eceff1 !important;
+    color: #1a237e !important;
+    border: 1px solid #cfd8dc !important;
+    padding: 2px 6px !important;
+    border-radius: 4px !important;
+    font-size: 0.92em !important;
+  }
+  .report-preview--pdf-export .markdown-body pre {
+    direction: ltr !important;
+    text-align: left !important;
+    unicode-bidi: isolate !important;
+    background: #f7f9fa !important;
+    color: #212121 !important;
+    border: 1px solid #cfd8dc !important;
+    border-radius: 8px !important;
+    padding: 14px 16px !important;
+    page-break-inside: avoid !important;
+    break-inside: avoid !important;
+  }
+  .report-preview--pdf-export .markdown-body pre code {
+    direction: ltr !important;
+    unicode-bidi: plaintext !important;
+    color: inherit !important;
+    border: none !important;
+    padding: 0 !important;
+    background: transparent !important;
+  }
+  .report-preview--pdf-export .markdown-body table {
+    table-layout: fixed !important;
+    font-size: 10pt !important;
+    border-collapse: collapse !important;
+    width: 100% !important;
+    margin: 1em 0 !important;
+    page-break-inside: auto !important;
+  }
+  .report-preview--pdf-export .markdown-body thead {
+    display: table-header-group !important;
+  }
+  .report-preview--pdf-export .markdown-body th {
+    background: #c8e6c9 !important;
+    color: #1b4332 !important;
+    border: 1px solid #7cb342 !important;
+    font-weight: 700 !important;
+    padding: 10px 12px !important;
+    text-align: start !important;
+    word-break: break-word !important;
+    overflow-wrap: anywhere !important;
+  }
+  .report-preview--pdf-export .markdown-body td {
+    border: 1px solid #b0bec5 !important;
+    padding: 9px 11px !important;
+    vertical-align: top !important;
+    color: #263238 !important;
+    background: #fff !important;
+    word-break: break-word !important;
+    overflow-wrap: anywhere !important;
+  }
+  .report-preview--pdf-export .markdown-body tbody tr:nth-child(even) td {
+    background: #f5f9f6 !important;
+  }
+  .report-preview--pdf-export .markdown-body blockquote {
+    border-inline-start: 4px solid #2e7d32 !important;
+    color: #37474f !important;
+    background: #f1f8e9 !important;
+    padding: 12px 16px !important;
+    margin: 1em 0 !important;
+    border-radius: 0 8px 8px 0 !important;
+    page-break-inside: avoid !important;
+  }
+  .report-preview--pdf-export .markdown-body a {
+    color: #0d47a1 !important;
+    text-decoration: underline !important;
+  }
+  .report-pdf-footer {
+    margin-top: 18px !important;
+    padding: 14px 16px !important;
+    background: #ffffff !important;
+    border: 1px solid #cfd8dc !important;
+    border-radius: 8px !important;
+    page-break-inside: avoid !important;
+  }
+  .report-pdf-footer__main {
+    color: #37474f !important;
+    font-size: 10.5pt !important;
+    font-weight: 600 !important;
+    line-height: 1.55 !important;
+  }
+  .report-pdf-footer__note {
+    color: #78909c !important;
+    font-size: 8.5pt !important;
+    margin-top: 8px !important;
+    padding-top: 8px !important;
+    border-top: 1px solid #eceff1 !important;
+    line-height: 1.45 !important;
+  }
+`
+
+function buildPdfLetterhead(clonedDoc, generatedAtLabel) {
+  const root = clonedDoc.createElement('div')
+  root.className = 'report-pdf-letterhead'
+  root.setAttribute('dir', 'rtl')
+  const accent = clonedDoc.createElement('div')
+  accent.className = 'report-pdf-letterhead__accent'
+  const inner = clonedDoc.createElement('div')
+  inner.className = 'report-pdf-letterhead__inner'
+  const brand = clonedDoc.createElement('div')
+  brand.className = 'report-pdf-letterhead__brand'
+  brand.textContent = 'بَيْنة'
+  const title = clonedDoc.createElement('div')
+  title.className = 'report-pdf-letterhead__title'
+  title.textContent = 'وثيقة تقرير فني'
+  const subtitle = clonedDoc.createElement('div')
+  subtitle.className = 'report-pdf-letterhead__subtitle'
+  subtitle.textContent =
+    'التحقيق الجنائي الرقمي — مسار التحليل الفني للأدلة والاستدلال الآلي (ICS / MITRE)'
+  const meta = clonedDoc.createElement('div')
+  meta.className = 'report-pdf-letterhead__meta'
+  meta.textContent = `تاريخ إخراج المستند: ${generatedAtLabel}`
+  inner.append(brand, title, subtitle, meta)
+  root.append(accent, inner)
+  return root
+}
+
+function injectPdfExportStyles(clonedDoc) {
+  const head = clonedDoc.head
+  if (!head) return
+  const id = 'baunah-report-pdf-styles'
+  if (clonedDoc.getElementById(id)) return
+  const style = clonedDoc.createElement('style')
+  style.id = id
+  style.textContent = REPORT_PDF_EXPORT_CSS
+  head.appendChild(style)
+}
+
 /**
  * Mirrors backend _build_custody_chain when JSON omits custody_chain (proxy/old API).
  * Uses client clock in UTC ISO form; staggers steps by 2s like the server.
  */
-function syntheticCustodyChainFromAnalysis(result, file) {
+function syntheticCustodyChainFromAnalysis(result, file, investigatorName = '') {
   const summary = result?.summary || {}
   const hashes = result?.hashes || {}
   const filename = String(summary.source_file || file?.name || 'evidence.csv')
@@ -116,6 +401,13 @@ function syntheticCustodyChainFromAnalysis(result, file) {
         'تحليل مُعمّق للسجلات ذات الاشتباه الأعلى، وربطها بمسار MITRE والتوصيات والتقرير عند تفعيل Gemini، مع الالتزام بالأدلة المرفوعة.',
     },
   ]
+  const inv = String(investigatorName || '').trim()
+  if (inv) {
+    steps.push({
+      step_ar: `تم الرفع بواسطة المحقق ${inv}`,
+      detail_ar: 'توثيق اسم المحقق المسؤول عن رفع الدليل الرقمي ضمن سلسلة الحيازة.',
+    })
+  }
   return steps.map((st, i) => ({
     ...st,
     at: new Date(base + i * 2000).toISOString(),
@@ -193,20 +485,20 @@ function staggerMissingTimes(rows, baseMs) {
   })
 }
 
-function resolveCustodyChainForDisplay(result, file) {
+function resolveCustodyChainForDisplay(result, file, investigatorName = '') {
   const raw = coerceCustodyArray(pickRawCustodyChain(result))
   if (custodyChainNeedsSynthetic(raw)) {
-    return syntheticCustodyChainFromAnalysis(result, file)
+    return syntheticCustodyChainFromAnalysis(result, file, investigatorName)
   }
   const normalized = raw.map(normalizeCustodyRow)
   return staggerMissingTimes(normalized)
 }
 
-function ensureCustodyChainOnResult(result, file) {
+function ensureCustodyChainOnResult(result, file, investigatorName = '') {
   if (!result || typeof result !== 'object') {
     return result
   }
-  result.custody_chain = resolveCustodyChainForDisplay(result, file)
+  result.custody_chain = resolveCustodyChainForDisplay(result, file, investigatorName)
   return result
 }
 
@@ -396,41 +688,56 @@ const recommendItems = [
   'مشاركة التقرير النهائي مع فريق الاستجابة والإدارة التنفيذية.',
 ]
 
-const API_BASE_URL = import.meta.env.VITE_IDS_API_URL || '/api'
+const API_BASE_URL = getApiBaseUrl()
+
+/**
+ * Profile next to the avatar; same name is sent as `investigator_name` on analyze.
+ * Override via `VITE_INVESTIGATOR_NAME` in `.env`.
+ */
+const INVESTIGATOR_PROFILE = Object.freeze({
+  name: String(import.meta.env.VITE_INVESTIGATOR_NAME || 'محمد').trim() || 'محمد',
+  roleLabel: 'محقق',
+})
 const chatbotWelcomeText = 'أهلاً وسهلاً، أنا منصة بَيّنة مساعدك الذكي في التحقيق الجنائي الرقمي. بعد التحقيق في الملف المرفق أقدّم لك هذه التوصيات، وفي حال أردت الاستفسار عن تفاصيل أخرى فلا تتردد في الاستفسار.'
 
 const springTransition = { type: 'spring', stiffness: 380, damping: 28 }
 
-function App() {
+function BaunahApp() {
+  const { logout } = useAuth()
   const reduceMotion = useReducedMotion()
   const [activeTab, setActiveTab] = useState('attack')
   const [uploadedFile, setUploadedFile] = useState(null)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [analysisError, setAnalysisError] = useState('')
   const [analysisResult, setAnalysisResult] = useState(null)
-  const [isReportVisible, setIsReportVisible] = useState(false)
+  const reportPreviewRef = useRef(null)
+  const [isPdfExporting, setIsPdfExporting] = useState(false)
   const [copiedHashKey, setCopiedHashKey] = useState('')
   const [chatMessages, setChatMessages] = useState([])
   const [chatInput, setChatInput] = useState('')
   const [isChatLoading, setIsChatLoading] = useState(false)
-  const [geminiStatus, setGeminiStatus] = useState({ label: 'Gemini: checking', mode: 'neutral' })
   const [isDraggingFile, setIsDraggingFile] = useState(false)
   const [now, setNow] = useState(() => new Date())
+
   const fileInfo = useMemo(
     () => ({
       name: 'evidence_log_2026-04-28.csv',
       type: 'CSV',
       size: '2.45 MB',
       date: '28 Apr 2026 - 10:11 AM',
-      by: 'محمد (المحقق)',
       hash256: '3f5e1c9b9ee0b5b2d6b72c3f7e8d909a3b1c4d5e6f7a8b9c0d1e2f3a4b5c6d7',
       md5: 'a7f3c6d2e9b7f8a1c3d4e5f678901234',
     }),
     [],
   )
   const currentFileInfo = useMemo(() => {
+    const invForCard =
+      (analysisResult?.investigator_name &&
+        String(analysisResult.investigator_name).trim()) ||
+      INVESTIGATOR_PROFILE.name
+    const byLine = invForCard ? `${invForCard} (المحقق)` : '— (لم يُحدَّد)'
     if (!uploadedFile) {
-      return fileInfo
+      return { ...fileInfo, by: byLine }
     }
     const fileType = uploadedFile.name.includes('.')
       ? uploadedFile.name.split('.').pop()?.toUpperCase()
@@ -444,8 +751,9 @@ function App() {
       date: uploadedFile.lastModified
         ? new Date(uploadedFile.lastModified).toLocaleString('en-GB')
         : fileInfo.date,
+      by: byLine,
     }
-  }, [fileInfo, uploadedFile])
+  }, [fileInfo, uploadedFile, analysisResult])
 
   const readErrorMessage = async (response) => {
     const fallback = `Analysis failed (HTTP ${response.status})`
@@ -478,6 +786,7 @@ function App() {
     try {
       const formData = new FormData()
       formData.append('file', selectedFile)
+      formData.append('investigator_name', INVESTIGATOR_PROFILE.name)
       const response = await fetch(`${API_BASE_URL}/analyze`, {
         method: 'POST',
         body: formData,
@@ -486,7 +795,11 @@ function App() {
         const message = await readErrorMessage(response)
         throw new Error(message)
       }
-      const result = ensureCustodyChainOnResult(await response.json(), selectedFile)
+      const result = ensureCustodyChainOnResult(
+        await response.json(),
+        selectedFile,
+        INVESTIGATOR_PROFILE.name,
+      )
       setAnalysisResult(result)
       setAnalysisError('')
       setActiveTab('attack')
@@ -541,11 +854,10 @@ function App() {
   )
   const summary = analysisResult?.summary
   const topSuspiciousRows = analysisResult?.top_suspicious_rows || []
-  const suspiciousFindings = analysisResult?.suspicious_findings || []
-  const displaySuspiciousFindings = useMemo(
-    () => mergeDuplicateSuspiciousFindings(suspiciousFindings),
-    [suspiciousFindings],
-  )
+  const displaySuspiciousFindings = useMemo(() => {
+    const suspiciousFindings = analysisResult?.suspicious_findings || []
+    return mergeDuplicateSuspiciousFindings(suspiciousFindings)
+  }, [analysisResult?.suspicious_findings])
   const mitreAttackMap = analysisResult?.mitre_attack_map ?? null
 
   const renderedCustodySteps = useMemo(() => {
@@ -558,7 +870,11 @@ function App() {
         icon: s.icon,
       }))
     }
-    const chain = resolveCustodyChainForDisplay(analysisResult, uploadedFile)
+    const chain = resolveCustodyChainForDisplay(
+      analysisResult,
+      uploadedFile,
+      INVESTIGATOR_PROFILE.name,
+    )
     if (!Array.isArray(chain) || chain.length === 0) {
       return custodyTimelinePlaceholder.map((s) => ({
         title: s.title,
@@ -601,21 +917,86 @@ function App() {
     MD5: currentFileInfo.md5,
   }
 
-  const handleDownloadReport = () => {
-    if (!analysisResult) {
+  const handleDownloadReport = async () => {
+    if (!analysisResult || !reportPreviewRef.current) {
       return
     }
-    const blob = new Blob([renderedMarkdownReport], {
-      type: 'text/markdown;charset=utf-8',
-    })
-    const url = URL.createObjectURL(blob)
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = `ids-report-${Date.now()}.md`
-    document.body.append(anchor)
-    anchor.click()
-    anchor.remove()
-    URL.revokeObjectURL(url)
+    const element = reportPreviewRef.current
+    const investigator = INVESTIGATOR_PROFILE.name
+    const pdfFilename = `ids-report-${sanitizeFileNameSegment(investigator || 'report')}-${Date.now()}.pdf`
+    setIsPdfExporting(true)
+    try {
+      await html2pdf()
+        .set({
+          margin: [16, 14, 16, 14],
+          filename: pdfFilename,
+          image: { type: 'jpeg', quality: 0.98 },
+          enableLinks: true,
+          html2canvas: {
+            scale: 2.5,
+            useCORS: true,
+            logging: false,
+            onclone: (clonedDoc, cloned) => {
+              injectPdfExportStyles(clonedDoc)
+              const node =
+                cloned && cloned.classList?.contains('report-preview')
+                  ? cloned
+                  : cloned?.querySelector?.('.report-preview') ||
+                    clonedDoc.querySelector('.report-preview')
+              if (node) {
+                node.classList.add('report-preview--pdf-export')
+                node.style.maxHeight = 'none'
+                node.style.overflow = 'visible'
+                node.style.height = 'auto'
+                node.style.width = '100%'
+                node.style.transform = 'none'
+                node.style.filter = 'none'
+                node.style.opacity = '1'
+                const card = node.querySelector('.report-markdown')
+                if (card) {
+                  card.style.width = '100%'
+                  card.style.maxWidth = '100%'
+                }
+                const when = new Date().toLocaleString('ar', {
+                  dateStyle: 'full',
+                  timeStyle: 'short',
+                  calendar: 'gregory',
+                })
+                const letterhead = buildPdfLetterhead(clonedDoc, when)
+                node.insertBefore(letterhead, node.firstChild)
+                const footer = clonedDoc.createElement('div')
+                footer.className = 'report-pdf-footer'
+                footer.setAttribute('dir', 'rtl')
+                const main = clonedDoc.createElement('div')
+                main.className = 'report-pdf-footer__main'
+                main.textContent = investigator
+                  ? `تم إصدار نسخة PDF من التقرير — المحقق: ${investigator} — ${when}`
+                  : `تم إصدار نسخة PDF من التقرير — ${when}`
+                const note = clonedDoc.createElement('div')
+                note.className = 'report-pdf-footer__note'
+                note.textContent =
+                  'منصة بَيْنة — وثيقة مُولَّدة من مسار التحليل؛ يُرجى الاحتفاظ بسلسلة الحيازة والبصمات الرقمية المرافقة.'
+                footer.append(main, note)
+                node.appendChild(footer)
+              }
+            },
+          },
+          jsPDF: {
+            unit: 'mm',
+            format: 'a4',
+            orientation: 'portrait',
+            compress: true,
+          },
+          pagebreak: {
+            mode: ['css', 'legacy'],
+            avoid: ['pre', 'blockquote'],
+          },
+        })
+        .from(element)
+        .save()
+    } finally {
+      setIsPdfExporting(false)
+    }
   }
 
   const handleSendChat = async () => {
@@ -657,18 +1038,11 @@ function App() {
 
       const data = await response.json()
       const answerText = data.answer || 'لا يوجد رد حالياً.'
-      const isQuotaFallback = answerText.includes('تعذر استخدام Gemini حالياً بسبب تجاوز الحصة')
-      setGeminiStatus(
-        isQuotaFallback
-          ? { label: 'Gemini: Quota exceeded (Fallback)', mode: 'warn' }
-          : { label: 'Gemini: Active', mode: 'ok' },
-      )
       setChatMessages((prev) => [
         ...prev,
         { role: 'assistant', content: answerText },
       ])
     } catch {
-      setGeminiStatus({ label: 'Gemini: unavailable (Fallback)', mode: 'warn' })
       setChatMessages((prev) => [
         ...prev,
         { role: 'assistant', content: 'تعذر الحصول على رد حالياً. حاول مرة أخرى.' },
@@ -687,24 +1061,6 @@ function App() {
       // Silently ignore clipboard errors to avoid interrupting the workflow.
     }
   }
-
-  useEffect(() => {
-    const checkGemini = async () => {
-      try {
-        const response = await fetch(`${API_BASE_URL}/setup-status`)
-        if (!response.ok) return
-        const data = await response.json()
-        setGeminiStatus(
-          data?.gemini_enabled
-            ? { label: 'Gemini: enabled', mode: 'ok' }
-            : { label: 'Gemini: disabled', mode: 'warn' },
-        )
-      } catch {
-        setGeminiStatus({ label: 'Gemini: unavailable', mode: 'warn' })
-      }
-    }
-    checkGemini()
-  }, [])
 
   useEffect(() => {
     const id = setInterval(() => setNow(new Date()), 1000)
@@ -742,6 +1098,15 @@ function App() {
           <ShieldCheck size={19} strokeWidth={2} aria-hidden />
           تحقق
         </button>
+        <button
+          type="button"
+          className="logout-btn sidebar-logout"
+          onClick={() => logout()}
+          aria-label="تسجيل الخروج"
+        >
+          <LogOut size={18} strokeWidth={2} aria-hidden />
+          تسجيل الخروج
+        </button>
         <small>الإصدار 1.0.0</small>
       </motion.aside>
 
@@ -761,9 +1126,9 @@ function App() {
             <UserRound size={16} />
           </span>
           <span className="user-meta">
-            <strong>محمد</strong>
+            <strong>{INVESTIGATOR_PROFILE.name}</strong>
             <small>
-              محقق
+              {INVESTIGATOR_PROFILE.roleLabel}
               <i className="online-dot" />
             </small>
           </span>
@@ -774,8 +1139,8 @@ function App() {
           <>
             <header className="top-header upload-header">
               <div className="datetime datetime-live">
-                <span><CalendarDays size={15} /> {liveDateLabel}</span>
-                <span><Clock3 size={15} /> {liveTimeLabel}</span>
+                <span dir="ltr"><CalendarDays size={15} /> {liveDateLabel}</span>
+                <span dir="ltr"><Clock3 size={15} /> {liveTimeLabel}</span>
               </div>
             </header>
 
@@ -785,7 +1150,6 @@ function App() {
               animate={{ opacity: 1, y: 0 }}
               transition={reduceMotion ? { duration: 0 } : { ...springTransition, delay: 0.12 }}
             >
-              <h2>رفع الدليل</h2>
               <label
                 className={`dropzone ${isDraggingFile ? 'is-dragover' : ''}`}
                 htmlFor="evidence-file"
@@ -804,7 +1168,7 @@ function App() {
                 >
                   <Upload size={48} />
                 </motion.div>
-                <strong>اسحب وأفلت ملف الدليل هنا</strong>
+                <strong>ارفع ملف الدليل</strong>
                 <span>CSV, LOG, PCAP, TXT</span>
                 <span className="upload-btn">اختر ملف</span>
                 <input
@@ -819,12 +1183,11 @@ function App() {
         ) : (
           <>
             <motion.header
-              className="top-header"
+              className="top-header top-header--after-upload"
               initial={reduceMotion ? false : { opacity: 0 }}
               animate={{ opacity: 1 }}
               transition={{ duration: reduceMotion ? 0 : 0.3 }}
             >
-              <h1>رفع الدليل</h1>
               <span className="check-pass">
                 <ShieldCheck size={16} />
                 تم رفع الملف بنجاح
@@ -924,6 +1287,15 @@ function App() {
                   {activeTab === 'attack' && (
                     <div className="attack-tab-stack">
                       <MitreAttackMap
+                        key={
+                          [
+                            analysisResult?.hashes?.SHA256,
+                            uploadedFile?.name,
+                            uploadedFile?.lastModified,
+                          ]
+                            .filter(Boolean)
+                            .join('|') || 'mitre-map'
+                        }
                         mapData={mitreAttackMap}
                         timeline={analysisResult?.timeline ?? null}
                         summary={summary ?? null}
@@ -1067,7 +1439,6 @@ function App() {
 
                   {activeTab === 'recommend' && (
                     <div className="recommend-chat-wrap">
-                      <div className={`gemini-status-badge ${geminiStatus.mode}`}>{geminiStatus.label}</div>
                       <p className="chat-welcome-text">{chatbotWelcomeText}</p>
 
                       <ol className="recommend-list">
@@ -1158,7 +1529,11 @@ function App() {
                           <step.icon className="timeline-icon" size={20} />
                           <span className="custody-step-badge">{index + 1}</span>
                           <h3>{step.title}</h3>
-                          {step.detail ? <p className="custody-detail">{step.detail}</p> : null}
+                          {step.detail ? (
+                            <p className="custody-detail" dir="auto">
+                              {step.detail}
+                            </p>
+                          ) : null}
                           <time
                             className="custody-at"
                             dateTime={step.dateTimeIso || undefined}
@@ -1175,39 +1550,31 @@ function App() {
                     <div className="report-section">
                       <div className="report-actions">
                         <motion.button
-                          className="ghost report-toggle-btn"
-                          type="button"
-                          onClick={() => setIsReportVisible((prev) => !prev)}
-                          disabled={!analysisResult}
-                          whileTap={reduceMotion ? undefined : { scale: 0.98 }}
-                        >
-                          {isReportVisible ? <EyeOff size={17} /> : <Eye size={17} />}
-                          {isReportVisible ? 'اخفاء التقرير' : 'عرض التقرير'}
-                        </motion.button>
-                        <motion.button
                           className="primary report-download-btn"
                           type="button"
                           onClick={handleDownloadReport}
-                          disabled={!analysisResult}
+                          disabled={!analysisResult || isPdfExporting}
                           whileTap={reduceMotion ? undefined : { scale: 0.98 }}
                         >
                           <Download size={17} />
-                          تحميل التقرير
+                          {isPdfExporting ? 'جاري التصدير…' : 'تحميل PDF'}
                         </motion.button>
                       </div>
-                      <AnimatePresence>
-                        {analysisResult && isReportVisible && (
-                          <motion.div
-                            className="report-preview report-preview--markdown"
-                            initial={{ opacity: 0, height: 0 }}
-                            animate={{ opacity: 1, height: 'auto' }}
-                            exit={{ opacity: 0, height: 0 }}
-                            transition={{ duration: reduceMotion ? 0 : 0.3 }}
-                          >
-                            <MarkdownBlock content={renderedMarkdownReport} className="report-markdown" />
-                          </motion.div>
-                        )}
-                      </AnimatePresence>
+                      {analysisResult ? (
+                        <motion.div
+                          ref={reportPreviewRef}
+                          className="report-preview report-preview--markdown"
+                          initial={{ opacity: 0, y: 8 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ duration: reduceMotion ? 0 : 0.25 }}
+                        >
+                          <MarkdownBlock
+                            content={renderedMarkdownReport}
+                            className="report-markdown"
+                            bidiAuto
+                          />
+                        </motion.div>
+                      ) : null}
                     </div>
                   )}
                 </motion.div>
@@ -1217,6 +1584,22 @@ function App() {
         )}
       </motion.main>
     </div>
+  )
+}
+
+function AuthGate() {
+  const { isAuthenticated } = useAuth()
+  if (!isAuthenticated) {
+    return <LoginPage />
+  }
+  return <BaunahApp />
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <AuthGate />
+    </AuthProvider>
   )
 }
 

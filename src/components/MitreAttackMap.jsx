@@ -312,14 +312,6 @@ export function MitreAttackMap({ mapData, timeline, summary }) {
   const nodeRefs = useRef([])
 
   useEffect(() => {
-    if (steps.length === 0) {
-      return
-    }
-    setActiveIndex(0)
-    setExpandedIndex(null)
-  }, [steps])
-
-  useEffect(() => {
     if (steps.length <= 1) {
       return undefined
     }

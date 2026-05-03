@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -13,7 +14,7 @@ import joblib
 import pandas as pd
 import requests
 import xgboost as xgb
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sklearn.model_selection import train_test_split
@@ -63,6 +64,38 @@ class ChatRecommendationRequest(BaseModel):
     suspicious_findings: list[dict[str, Any]] | None = None
     mitre_attack_map: dict[str, Any] | None = None
     history: list[dict[str, str]] | None = None
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class LoginResponse(BaseModel):
+    """OAuth2-style payload — replace access_token with a signed JWT when hardening."""
+
+    access_token: str
+    token_type: str = "bearer"
+    username: str
+
+
+# Static demo account — replace with DB + password hashes + JWT (python-jose, passlib).
+_AUTH_DEMO_USERNAME = "1111"
+_AUTH_DEMO_PASSWORD = "1111"
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+def auth_login(payload: LoginRequest) -> LoginResponse:
+    if (
+        payload.username != _AUTH_DEMO_USERNAME
+        or payload.password != _AUTH_DEMO_PASSWORD
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="اسم المستخدم أو كلمة المرور غير صحيحة.",
+        )
+    token = secrets.token_urlsafe(48)
+    return LoginResponse(access_token=token, username=payload.username)
 
 
 def _local_investigator_answer(question: str) -> str:
@@ -1025,10 +1058,11 @@ def _build_custody_chain(
     byte_len: int,
     summary: dict[str, Any],
     inference_mode: str,
+    investigator_name: str | None = None,
 ) -> list[dict[str, Any]]:
     base = datetime.utcnow()
     sha = hashes.get("SHA256", "")
-    steps = [
+    steps: list[dict[str, str]] = [
         {
             "step_ar": "رفع الدليل الرقمي",
             "detail_ar": f"الملف: {filename} — الحجم {byte_len:,} بايت.",
@@ -1054,6 +1088,16 @@ def _build_custody_chain(
             ),
         },
     ]
+    inv = (investigator_name or "").strip()
+    if inv:
+        steps.append(
+            {
+                "step_ar": f"تم الرفع بواسطة المحقق {inv}",
+                "detail_ar": (
+                    "توثيق اسم المحقق المسؤول عن رفع الدليل الرقمي ضمن سلسلة الحيازة."
+                ),
+            }
+        )
     out: list[dict[str, Any]] = []
     for i, st in enumerate(steps):
         ts = (base + timedelta(seconds=i * 2)).isoformat() + "Z"
@@ -1064,8 +1108,12 @@ def _build_custody_chain(
 def _custody_chain_markdown(chain: list[dict[str, Any]]) -> str:
     lines = ["## سلسلة الحيازة والخطوات التقنية", ""]
     for i, step in enumerate(chain, 1):
-        lines.append(f"{i}. **{step.get('step_ar', '')}** — `{step.get('at', '')}`")
-        lines.append(f"   - {step.get('detail_ar', '')}")
+        title = str(step.get("step_ar") or "").strip()
+        at = str(step.get("at") or "").strip()
+        detail = str(step.get("detail_ar") or "").strip()
+        lines.append(f"{i}. **{title}** — `{at}`")
+        if detail:
+            lines.append(f"    - {detail}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -1289,45 +1337,150 @@ def _align_columns_with_training_schema(
     return aligned, missing_cols
 
 
+def _format_timeline_item_for_report_md(item: dict[str, Any]) -> str:
+    """One timeline line: `TIME: title (MITRE: …) - details` (matches formal report style)."""
+    t = str(item.get("time") or "-").strip()
+    title = str(item.get("title") or "-").strip()
+    mitre = str(item.get("mitre") or "").strip()
+    detail = str(item.get("detail") or "").strip()
+    mitre_part = f" ({mitre})" if mitre else ""
+    dash = " - " if detail else ""
+    return f"- {t}: {title}{mitre_part}{dash}{detail}"
+
+
+def _severity_label_from_rate(malicious_rate: float) -> str:
+    if malicious_rate > 0.35:
+        return "عالية"
+    if malicious_rate > 0.1:
+        return "متوسطة"
+    return "منخفضة"
+
+
+def _ensure_final_report_has_severity(text: str, malicious_rate: float) -> str:
+    ft = (text or "").strip()
+    if not ft:
+        return f"تصنيف الشدة الإجمالي: {_severity_label_from_rate(malicious_rate)}."
+    if "تصنيف الشدة الإجمالي" in ft:
+        return ft
+    sep = "" if ft.endswith(".") else "."
+    return f"{ft}{sep} تصنيف الشدة الإجمالي: {_severity_label_from_rate(malicious_rate)}."
+
+
+def _suspicious_findings_report_md(findings: list[dict[str, Any]] | None) -> str | None:
+    if not findings:
+        return None
+    lines: list[str] = []
+    for f in findings[:8]:
+        if not isinstance(f, dict):
+            continue
+        rid = f.get("row_index", "?")
+        score = float(f.get("risk_score", 0) or 0) * 100
+        sp = str(f.get("suspected_process_or_file") or "").strip()
+        why = str(f.get("why_malicious") or "").strip()
+        nxt = str(f.get("investigator_next_step") or "").strip()
+        body = f"- **الصف {rid}** (احتمال نموذجي **{score:.2f}%**)"
+        if sp:
+            body += f": {sp}"
+        if why:
+            w = why if len(why) <= 400 else why[:397] + "…"
+            body += f"\n  - **لماذا يبدو مشبوهاً:** {w}"
+        if nxt:
+            n = nxt if len(nxt) <= 220 else nxt[:217] + "…"
+            body += f"\n  - **خطوة المحقق:** {n}"
+        lines.append(body)
+    if not lines:
+        return None
+    return "\n".join(lines)
+
+
 def _build_fallback_markdown(
     summary: dict[str, Any],
     timeline: list[dict[str, Any]],
     recommendations: list[str],
     final_report: str,
     top_suspicious_rows: list[dict[str, Any]],
+    suspicious_findings: list[dict[str, Any]] | None = None,
 ) -> str:
-    timeline_md = "\n".join(
+    total = summary.get("total_records", 0)
+    malicious = summary.get("malicious_count", 0)
+    rate_pct = float(summary.get("malicious_rate", 0.0) or 0.0) * 100
+    avg_pct = float(summary.get("average_malicious_probability", 0.0) or 0.0) * 100
+    high_risk = summary.get("high_risk_count", 0)
+    mode = summary.get("inference_mode", "unknown")
+
+    summary_section = (
+        "## ملخص التنبؤات\n\n"
+        f"- إجمالي السجلات: **{total}**\n"
+        f"- السجلات الضارة: **{malicious}**\n"
+        f"- نسبة السلوك الضار: **{rate_pct:.2f}%**\n"
+        f"- متوسط احتمال الهجوم: **{avg_pct:.2f}%**\n"
+        f"- تدفقات عالية الخطورة: **{high_risk}**\n"
+        f"- نمط الاستدلال: **{mode}**\n"
+    )
+
+    suspicious_lines: list[str] = []
+    for row in top_suspicious_rows:
+        if not isinstance(row, dict):
+            continue
+        ri = row.get("row_index", "-")
+        sc = float(row.get("score", 0) or 0) * 100
+        suspicious_lines.append(f"- الصف {ri}: احتمال الهجوم {sc:.2f}%")
+    suspicious_md = (
+        "\n".join(suspicious_lines)
+        if suspicious_lines
+        else "- لا توجد سجلات مشبوهة مُبرزة في هذه العيّنة."
+    )
+
+    findings_block = _suspicious_findings_report_md(suspicious_findings)
+
+    timeline_lines: list[str] = []
+    for item in timeline:
+        if isinstance(item, dict):
+            timeline_lines.append(_format_timeline_item_for_report_md(item))
+    timeline_md = (
+        "\n".join(timeline_lines)
+        if timeline_lines
+        else "- لا يوجد تسلسل زمني مُستخرج من البيانات."
+    )
+
+    rec_md = "\n".join(f"- {item}" for item in recommendations) if recommendations else "- لا توجد توصيات."
+
+    conclusion = (final_report or "").strip() or "لم تُنجز خلاصة آلية."
+
+    parts = [
+        "# التقرير الجنائي الرقمي",
+        "",
+        summary_section,
+        "## أعلى السجلات المشبوهة",
+        "",
+        suspicious_md,
+        "",
+    ]
+    if findings_block:
+        parts.extend(
+            [
+                "## تحليل السجلات المشبوهة (تفصيل المحقق)",
+                "",
+                findings_block,
+                "",
+            ]
+        )
+    parts.extend(
         [
-            f"- **{item.get('time', '-')}:** {item.get('title', '-')}"
-            f" ({item.get('mitre', '-')}) - {item.get('detail', '-')}"
-            for item in timeline
+            "## التسلسل الزمني للهجوم",
+            "",
+            timeline_md,
+            "",
+            "## توصيات عاجلة",
+            "",
+            rec_md,
+            "",
+            "## الخلاصة",
+            "",
+            conclusion,
         ]
     )
-    rec_md = "\n".join([f"- {item}" for item in recommendations])
-    suspicious_md = "\n".join(
-        [
-            f"- الصف **{row.get('row_index', '-') }**: احتمال الهجوم **{float(row.get('score', 0)) * 100:.2f}%**"
-            for row in top_suspicious_rows
-        ]
-    )
-    return (
-        "# التقرير الجنائي الرقمي\n\n"
-        "## ملخص التنبؤات\n"
-        f"- إجمالي السجلات: **{summary.get('total_records', 0)}**\n"
-        f"- السجلات الضارة: **{summary.get('malicious_count', 0)}**\n"
-        f"- نسبة السلوك الضار: **{summary.get('malicious_rate', 0.0) * 100:.2f}%**\n"
-        f"- متوسط احتمال الهجوم: **{summary.get('average_malicious_probability', 0.0) * 100:.2f}%**\n"
-        f"- تدفقات عالية الخطورة: **{summary.get('high_risk_count', 0)}**\n"
-        f"- نمط الاستدلال: **{summary.get('inference_mode', 'unknown')}**\n\n"
-        "## أعلى السجلات المشبوهة\n"
-        f"{suspicious_md or '- لا يوجد'}\n\n"
-        "## التسلسل الزمني للهجوم\n"
-        f"{timeline_md or '- لا يوجد'}\n\n"
-        "## توصيات عاجلة\n"
-        f"{rec_md or '- لا يوجد'}\n\n"
-        "## الخلاصة\n"
-        f"{final_report}\n"
-    )
+    return "\n".join(parts).rstrip() + "\n"
 
 
 def _strip_ids_from_report_markdown(md: str) -> str:
@@ -1345,6 +1498,35 @@ def _strip_ids_from_report_markdown(md: str) -> str:
         "التقرير الجنائي الرقمي",
         md,
     )
+
+
+def _investigator_report_section_md(name: str) -> str:
+    """Arabic «معلومات المحقق» under the main report heading — تم الرفع بواسطة المحقق + الاسم."""
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        "## معلومات المحقق\n\n"
+        f"تم الرفع بواسطة المحقق **{name}**.\n\n"
+        f"**تاريخ إعداد التقرير:** {ts}\n"
+    )
+
+
+def _inject_investigator_into_markdown(md: str, investigator_name: str | None) -> str:
+    """Insert «معلومات المحقق» immediately under the forensic report title."""
+    if not investigator_name or not str(investigator_name).strip():
+        return md
+    name = str(investigator_name).strip()
+    block = _investigator_report_section_md(name)
+    if not isinstance(md, str):
+        return f"# التقرير الجنائي الرقمي\n\n{block}"
+    text = md.lstrip("\ufeff").rstrip()
+    if not text:
+        return f"# التقرير الجنائي الرقمي\n\n{block}"
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("#") and "التقرير الجنائي" in stripped:
+            return "\n".join(lines[: i + 1] + ["", block.rstrip(), ""] + lines[i + 1 :])
+    return f"{block}\n\n{text}\n"
 
 
 def _dynamic_recommendations_from_evidence(
@@ -1453,13 +1635,18 @@ def _dynamic_final_report_from_evidence(
     tags = {t for e in row_evidence for t in (e.get("context_tags") or [])}
     tags_txt = "، ".join(sorted(tags)) if tags else "لا توجد وسوم سياقية إضافية"
 
+    hyp_line = (
+        f"الفرضية السلوكية الأبرز: {hyp}."
+        if hyp
+        else "الفرضية السلوكية الأبرز: غير محدد — راجع احتمالات النموذج والحقول."
+    )
     return (
         f"التحليل الحالي للملف يُظهر {mal} سجلًا عالي الاشتباه من أصل {total} "
         f"(نسبة خبث {rate*100:.2f}%، ومتوسط احتمال {avg*100:.2f}%) بنمط استدلال {mode}. "
         f"المسار المُستنتج من الأدلة يتضمن التكتيكات: {tactics_txt}. "
         f"أبرز التقنيات المرصودة: {tids_txt}. "
         f"الوسوم السياقية: {tags_txt}. "
-        f"{('الفرضية السلوكية الأبرز: ' + hyp + '.') if hyp else ''}"
+        f"{hyp_line}"
     ).strip()
 
 
@@ -1502,6 +1689,7 @@ def _gemini_enrich(
     summary: dict[str, Any],
     top_suspicious_rows: list[dict[str, Any]],
     row_evidence: list[dict[str, Any]] | None = None,
+    investigator_name: str | None = None,
 ) -> dict[str, Any]:
     row_evidence = row_evidence or []
     guide_excerpt = _mitre_guide_excerpt(9500)
@@ -1540,7 +1728,6 @@ def _gemini_enrich(
         timeline: list[Any],
         recommendations: list[Any],
         final_summary: str,
-        markdown: str | None,
         raw_mitre: Any,
         *,
         gemini_mitre_used: bool = False,
@@ -1575,12 +1762,18 @@ def _gemini_enrich(
         )
         if _looks_generic_final_report(final_summary_text):
             final_summary_text = dynamic_summary
-        md = markdown or _build_fallback_markdown(
+        final_summary_text = _ensure_final_report_has_severity(
+            final_summary_text, float(summary.get("malicious_rate", 0))
+        )
+        # Markdown is assembled only from merged pipeline outputs (never model-freeform text)
+        # so numbers and sections always match timeline/recommendations/summary.
+        md = _build_fallback_markdown(
             summary=summary,
             timeline=merged_timeline,
             recommendations=rec_merged,
             final_report=final_summary_text,
             top_suspicious_rows=top_suspicious_rows,
+            suspicious_findings=None,
         )
         md = _strip_ids_from_report_markdown(md)
         mitre_map = _normalize_mitre_attack_map(
@@ -1628,15 +1821,17 @@ def _gemini_enrich(
             fallback["timeline"],
             fallback["recommendations"],
             fallback["final_report"],
-            _build_fallback_markdown(
-                summary=summary,
-                timeline=fallback["timeline"],
-                recommendations=fallback["recommendations"],
-                final_report=fallback["final_report"],
-                top_suspicious_rows=top_suspicious_rows,
-            ),
             None,
             gemini_mitre_used=False,
+        )
+
+    inv_ctx = ""
+    inv_st = (investigator_name or "").strip()
+    if inv_st:
+        inv_ctx = (
+            f"سياق الطلب: المحقق المسؤول عن رفع الدليل هو «{inv_st}». "
+            "أبرز هذا الاسم باختصار في narrative_ar أو في فقرة final_report بشكل طبيعي. "
+            "لا تنشئ عنواناً منفصلاً باسم «معلومات المحقق» لأنه يُضاف آلياً لاحقاً.\n\n"
         )
 
     schema_hint = (
@@ -1661,15 +1856,17 @@ def _gemini_enrich(
         "}"
     )
     prompt = (
-        "أنت محلل أمن سيبراني OT/ICS وخبير MITRE ATT&CK. أعد JSON صارم بالمفاتيح: "
-        "timeline, recommendations, final_report, markdown_report, mitre_attack_map.\n"
+        f"{inv_ctx}"
+        "أنت محلل أمن سيبراني OT/ICS وخبير MITRE ATT&CK. أعد JSON صارم بالمفاتيح فقط: "
+        "timeline, recommendations, final_report, mitre_attack_map.\n"
+        "لا تُرجع markdown_report — يُجمَّع تقرير Markdown على الخادم من هذه الحقول ومن summary حتى تطابق الأرقام والأقسام دائماً.\n"
         "- timeline: مصفوفة عناصر فيها time, title (عربي), mitre (مثل MITRE: Txxxx), detail (عربي). "
         "رتّب الأحداث زمنياً تصاعدياً؛ استخدم أوقاتاً منطقية من row_evidence (event_time_display) أو من "
         "البيانات الأصلية، ولا تستخدم Flow Duration كوقت تقويمي.\n"
         "- recommendations: نصوص عربية عملية.\n"
-        "- final_report: فقرة عربية مختصرة.\n"
-        "- markdown_report: تقرير Markdown احترافي يتضمن ملخص النموذج ومسار MITRE باختصار؛ "
-        "العنوان الرئيسي يبدأ بـ # التقرير الجنائي الرقمي دون إضافة (IDS).\n"
+        "- final_report: فقرة عربية مختصرة تلخّص المسار والشدة وتتوافق عددياً مع summary؛ "
+        "إن وُجد اسم المحقق في السياق أعلاه، أذكره بجملة طبيعية. "
+        "لا تُكرر جداول الملخص؛ سيتم إضافة «تصنيف الشدة الإجمالي» على الخادم إن غاب.\n"
         "- mitre_attack_map: خريطة مراحل هجوم متسلسلة مرتبطة بالأدلة، بنية كالتالي:\n"
         f"{schema_hint}\n"
         "التزم بماتريكس MITRE ATT&CK للأنظمة الصناعية (ICS): "
@@ -1725,7 +1922,6 @@ def _gemini_enrich(
                 "recommendations", base_report["recommendations"]
             )
             final_summary = parsed.get("final_report", base_report["final_report"])
-            markdown = parsed.get("markdown_report")
             raw_mitre = parsed.get("mitre_attack_map")
             if explicit_timeline_mode:
                 st = raw_mitre.get("stages") if isinstance(raw_mitre, dict) else None
@@ -1741,7 +1937,6 @@ def _gemini_enrich(
                 final_timeline,
                 final_recommendations,
                 final_summary,
-                markdown,
                 raw_mitre,
                 gemini_mitre_used=gemini_mitre_ok,
             )
@@ -1758,13 +1953,6 @@ def _gemini_enrich(
         fallback["timeline"],
         fallback["recommendations"],
         fallback["final_report"],
-        _build_fallback_markdown(
-            summary=summary,
-            timeline=fallback["timeline"],
-            recommendations=fallback["recommendations"],
-            final_report=fallback["final_report"],
-            top_suspicious_rows=top_suspicious_rows,
-        ),
         None,
         gemini_mitre_used=False,
     )
@@ -2294,11 +2482,15 @@ def setup_status() -> dict[str, Any]:
 
 
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
+async def analyze(
+    file: UploadFile = File(...),
+    investigator_name: str | None = Form(default=None),
+) -> dict[str, Any]:
     if not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are supported.")
 
     content = await file.read()
+    inv_name = (investigator_name or "").strip() or None
     hashes = _calculate_hashes(content)
     try:
         df = pd.read_csv(StringIO(content.decode("utf-8", errors="ignore")))
@@ -2421,32 +2613,67 @@ async def analyze(file: UploadFile = File(...)) -> dict[str, Any]:
         len(content),
         summary,
         inference_mode,
+        inv_name,
     )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_enrich = pool.submit(
-            _gemini_enrich,
-            base_report,
-            summary,
-            top_suspicious_rows,
-            row_evidence_list,
+    # Bound wait so workers cannot hang indefinitely; keeps Vite/nginx proxies from returning 502.
+    _enrich_deadline_s = 180
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_enrich = pool.submit(
+                _gemini_enrich,
+                base_report,
+                summary,
+                top_suspicious_rows,
+                row_evidence_list,
+                inv_name,
+            )
+            fut_susp = pool.submit(
+                _gemini_suspicious_analysis,
+                summary,
+                top_suspicious_rows,
+                row_evidence_list,
+            )
+            report = fut_enrich.result(timeout=_enrich_deadline_s)
+            suspicious_findings = fut_susp.result(timeout=_enrich_deadline_s)
+    except Exception:
+        analysis_warnings.append(
+            "تعذر إكمال إثراء التحليل (Gemini أو مهلة الانتظار)؛ عُرضت النتائج الأساسية والمسار الاحتياطي."
         )
-        fut_susp = pool.submit(
-            _gemini_suspicious_analysis,
-            summary,
-            top_suspicious_rows,
-            row_evidence_list,
+        report = {
+            "timeline": base_report["timeline"],
+            "recommendations": base_report["recommendations"],
+            "final_report": base_report["final_report"],
+            "mitre_attack_map": _normalize_mitre_attack_map(
+                None, base_report["timeline"], summary, row_evidence_list
+            ),
+        }
+        suspicious_findings = _build_fallback_suspicious_analysis(
+            top_suspicious_rows, malicious_rate, row_evidence_list
         )
-        report = fut_enrich.result()
-        suspicious_findings = fut_susp.result()
 
-    md = _strip_ids_from_report_markdown((report.get("markdown_report") or "").rstrip())
+    fr = _ensure_final_report_has_severity(
+        str(report.get("final_report") or ""),
+        float(summary.get("malicious_rate", 0)),
+    )
+    report["final_report"] = fr
+    md_core = _build_fallback_markdown(
+        summary=summary,
+        timeline=report["timeline"],
+        recommendations=report["recommendations"],
+        final_report=fr,
+        top_suspicious_rows=top_suspicious_rows,
+        suspicious_findings=suspicious_findings,
+    )
+    md = _strip_ids_from_report_markdown(md_core.rstrip())
+    md = _inject_investigator_into_markdown(md, inv_name)
     report["markdown_report"] = md + "\n\n" + _custody_chain_markdown(custody_chain)
 
     return {
         "summary": summary,
         "warnings": analysis_warnings,
         "hashes": hashes,
+        "investigator_name": inv_name,
         "timeline": report["timeline"],
         "recommendations": report["recommendations"],
         "final_report": report["final_report"],
